@@ -67,6 +67,54 @@ classdef MultiModalSensing < handle
             obj.dictionary = obj.generate_joint_dictionary();
         end
         
+        function sensing_result = perform_multimodal_sensing(obj, tx_pos, rx_pos, t)
+            try
+                % 1. 执行角度域感知
+                fprintf('执行角度感知...\n');
+                angle_measurement = obj.perform_angle_sensing(tx_pos, rx_pos, t);
+                % 2. 执行距离-多普勒感知
+                fprintf('执行距离-多普勒感知...\n');
+                range_doppler = obj.perform_range_doppler_sensing(tx_pos, rx_pos);
+                
+                % 3. 执行极化域感知
+                fprintf('执行极化感知...\n');
+                polarization = obj.perform_polarization_sensing(tx_pos, rx_pos);
+                
+                % 4. 特征级融合
+                fprintf('执行特征融合...\n');
+                fusion_result = obj.feature_fusion(angle_measurement, range_doppler, polarization);
+                
+                % 构造返回结果结构体
+                sensing_result = struct(...
+                    'range', range_doppler.range, ...
+                    'velocity', range_doppler.velocity, ...
+                    'theta', angle_measurement.theta, ...
+                    'phi', angle_measurement.phi, ...
+                    'gamma', polarization.gamma, ...
+                    'eta', polarization.eta, ...
+                    'confidence', fusion_result, ...
+                    'timestamp', t);
+                
+                % 打印调试信息
+                fprintf('多模态感知完成 (t = %.3f s)\n', t);
+                fprintf('估计结果:\n');
+                fprintf('  距离: %.2f m\n', sensing_result.range);
+                fprintf('  速度: %.2f m/s\n', sensing_result.velocity);
+                fprintf('  方位角: %.2f°\n', rad2deg(sensing_result.theta));
+                fprintf('  俯仰角: %.2f°\n', rad2deg(sensing_result.phi));
+                
+            catch ME
+                obj.error_count = obj.error_count + 1;
+                obj.last_error_time = datetime('2025-03-13 06:30:34');
+                fprintf('多模态感知执行失败：\n');
+                fprintf('错误信息：%s\n', ME.message);
+                fprintf('错误位置：%s (行 %d)\n', ME.stack(1).name, ME.stack(1).line);
+                fprintf('时间：%s\n', datestr(obj.last_error_time));
+                fprintf('用户：zz17Pan\n');
+                rethrow(ME);
+            end
+        end
+
         function dict = generate_joint_dictionary(obj)
             try
                 % 角度网格定义
@@ -128,62 +176,82 @@ classdef MultiModalSensing < handle
         end
         
         function result = perform_angle_sensing(obj, tx_pos, rx_pos, t)
-            try
-                % 获取感知子阵的索引
-                [~, sens_subarrays] = ResourceAllocation.allocate_subarrays();
-                
-                % 计算子阵索引范围
-                tx_start = (sens_subarrays.tx-1)*obj.cfg.N_at + 1;
-                tx_end = min(tx_start + obj.cfg.N_at - 1, size(tx_pos,1));
-                rx_start = (sens_subarrays.rx-1)*obj.cfg.N_ar + 1;
-                rx_end = min(rx_start + obj.cfg.N_ar - 1, size(rx_pos,1));
-                
-                % 提取有效的发射和接收位置
-                valid_tx_idx = tx_start:tx_end;
-                valid_rx_idx = rx_start:rx_end;
-                
-                % 打印调试信息
-                fprintf('角度感知子阵索引：\n');
-                fprintf('tx索引范围: [%d, %d]\n', min(valid_tx_idx), max(valid_tx_idx));
-                fprintf('rx索引范围: [%d, %d]\n', min(valid_rx_idx), max(valid_rx_idx));
-                
-                % 生成导频信号
-                s_pilot = ResourceAllocation.generate_pilot_signals(length(valid_tx_idx));
-                
-                % 生成感知信道
-                H_sens = ChannelHSPM.generate_channel(tx_pos(valid_tx_idx,:), ...
-                                                    rx_pos(valid_rx_idx,:), t);
-                
-                % 添加噪声
-                noise = (randn(size(H_sens,1),size(s_pilot,2)) + ...
-                        1j*randn(size(H_sens,1),size(s_pilot,2)))/sqrt(2);
-                SNR_linear = 10^(obj.cfg.SNR_dB/10);
-                y_sens = H_sens * s_pilot + noise/sqrt(SNR_linear);
-                
-                % WOMP估计
-                prior = obj.generate_prior();
-                [idx_set, x_hat] = obj.womp.process(y_sens(:,1), obj.dictionary, prior);
-                
-                % 从支持集重建参数
-                result = obj.reconstruct_parameters(idx_set, x_hat);
-                
-            catch ME
-                obj.error_count = obj.error_count + 1;
-                obj.last_error_time = datetime('2025-03-13 05:30:40', 'InputFormat', 'yyyy-MM-dd HH:mm:ss');
-                fprintf('角度感知过程出错：\n');
-                fprintf('错误信息：%s\n', ME.message);
-                fprintf('错误位置：%s (行 %d)\n', ME.stack(1).name, ME.stack(1).line);
-                fprintf('时间：%s\n', datestr(obj.last_error_time));
-                fprintf('用户：zz17Pan\n');
-                if exist('H_sens', 'var')
-                    fprintf('H_sens维度: [%d, %d]\n', size(H_sens));
-                end
-                if exist('s_pilot', 'var')
-                    fprintf('s_pilot维度: [%d, %d]\n', size(s_pilot));
-                end
-                rethrow(ME);
-            end
+    try
+        % 获取感知子阵的索引
+        [~, sens_subarrays] = ResourceAllocation.allocate_subarrays();
+        
+        % 验证输入维度
+        if size(tx_pos, 2) ~= 3 || size(rx_pos, 2) ~= 3
+            error('天线位置维度错误：需要Nx3矩阵');
         end
+        
+        % 计算子阵大小
+        N_ant_subarray = obj.cfg.Nx * obj.cfg.Nz;
+        
+        % 计算子阵索引范围
+        tx_start = (sens_subarrays.tx-1) * N_ant_subarray + 1;
+        rx_start = (sens_subarrays.rx-1) * N_ant_subarray + 1;
+        
+        % 验证索引范围
+        if tx_start + N_ant_subarray - 1 > size(tx_pos,1) || ...
+           rx_start + N_ant_subarray - 1 > size(rx_pos,1)
+            error('子阵索引超出范围');
+        end
+        
+        % 提取感知子阵
+        tx_subarray = tx_pos(tx_start:tx_start+N_ant_subarray-1, :);
+        rx_subarray = rx_pos(rx_start:rx_start+N_ant_subarray-1, :);
+        
+        % 生成导频信号
+        s_pilot = ResourceAllocation.generate_pilot_signals(N_ant_subarray);
+        
+        % 验证信号维度
+        if size(s_pilot,1) ~= N_ant_subarray
+            error('导频信号维度不匹配：期望%d，实际%d', ...
+                N_ant_subarray, size(s_pilot,1));
+        end
+        
+        % 生成感知信道
+        H_sens = ChannelHSPM.generate_channel(tx_subarray, rx_subarray, t);
+        
+        % 添加噪声
+        noise = (randn(size(H_sens,1),size(s_pilot,2)) + ...
+                1j*randn(size(H_sens,1),size(s_pilot,2)))/sqrt(2);
+        SNR_linear = 10^(obj.cfg.SNR_dB/10);
+        y_sens = H_sens * s_pilot + noise/sqrt(SNR_linear);
+        
+        % WOMP估计
+        prior = obj.generate_prior();
+        [idx_set, x_hat] = obj.womp.process(y_sens(:,1), obj.dictionary, prior);
+        
+        % 从支持集重建参数
+        result = obj.reconstruct_parameters(idx_set, x_hat);
+        
+        % 打印调试信息
+        fprintf('角度感知完成:\n');
+        fprintf('子阵维度: tx[%d,%d], rx[%d,%d]\n', ...
+            size(tx_subarray,1), size(tx_subarray,2), ...
+            size(rx_subarray,1), size(rx_subarray,2));
+        fprintf('信道矩阵维度: [%d,%d]\n', size(H_sens));
+        fprintf('导频信号维度: [%d,%d]\n', size(s_pilot));
+        
+    catch ME
+        obj.error_count = obj.error_count + 1;
+        obj.last_error_time = datetime('2025-03-13 07:07:17');
+        fprintf('角度感知过程出错：\n');
+        fprintf('错误信息：%s\n', ME.message);
+        fprintf('错误位置：%s (行 %d)\n', ME.stack(1).name, ME.stack(1).line);
+        fprintf('时间：%s\n', datestr(obj.last_error_time));
+        fprintf('用户：zz17Pan\n');
+        if exist('H_sens', 'var')
+            fprintf('H_sens维度: [%d, %d]\n', size(H_sens));
+        end
+        if exist('s_pilot', 'var')
+            fprintf('s_pilot维度: [%d, %d]\n', size(s_pilot));
+        end
+        rethrow(ME);
+    end
+end
         
         function result = perform_range_doppler_sensing(obj, tx_pos, rx_pos)
             try
